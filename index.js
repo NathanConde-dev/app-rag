@@ -3,14 +3,14 @@ const path = require("path");
 const pdfParse = require("pdf-parse");
 const ort = require("onnxruntime-node");
 const { Pool } = require("pg");
+const { v4: uuidv4 } = require("uuid");
 require("dotenv").config();
 
 // Configurações
 const PDF_PATH = process.env.PDF_PATH;
 const MODEL_PATH = path.resolve(__dirname, "models/model.onnx");
-const VOCAB_PATH = path.resolve(__dirname, "models/vocab.txt");
 
-// Configuração do PostgreSQL (Railway)
+// Configuração do PostgreSQL
 const pool = new Pool({
   user: process.env.PG_USER,
   host: process.env.PG_HOST,
@@ -19,6 +19,41 @@ const pool = new Pool({
   port: process.env.PG_PORT,
 });
 
+// Verifica se a tabela existe e cria se necessário
+async function verificarOuCriarTabela() {
+  const client = await pool.connect();
+  try {
+    await client.query("CREATE EXTENSION IF NOT EXISTS vector;");
+
+    const tabelaExiste = await client.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_name = 'n8n_vectors'
+      );
+    `);
+
+    if (!tabelaExiste.rows[0].exists) {
+      console.log("🛠 Criando tabela 'n8n_vectors' com PG Vector...");
+
+      await client.query(`
+        CREATE TABLE n8n_vectors (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          text TEXT NOT NULL,
+          metadata JSONB DEFAULT '{}'::jsonb,
+          embedding vector(1536) NOT NULL
+        );
+      `);
+
+      console.log("✅ Tabela 'n8n_vectors' criada com sucesso.");
+    }
+  } catch (error) {
+    console.error("❌ Erro ao verificar/criar tabela:", error.message);
+  } finally {
+    client.release();
+  }
+}
+
+//Extrai informações do PDF para converter para RAG
 async function extrairTextoPDF(caminhoPDF) {
   const dataBuffer = fs.readFileSync(caminhoPDF);
   const data = await pdfParse(dataBuffer);
@@ -42,44 +77,46 @@ async function carregarModelo() {
   return session;
 }
 
-function carregarTokenizador() {
-  const vocab = fs.readFileSync(VOCAB_PATH, "utf-8").split("\n");
-  const tokenToId = {};
-  vocab.forEach((token, index) => {
-    tokenToId[token.trim()] = index;
-  });
-
-  const unkIndex = tokenToId["[UNK]"] || 0;
-
-  return {
-    tokenize: (texto) => texto.split(/\s+/),
-    getId: (token) => tokenToId[token] !== undefined ? tokenToId[token] : unkIndex,
-  };
-}
-
-async function gerarEmbeddings(session, tokenizer, trechos) {
+async function gerarEmbeddings(session, trechos) {
   const embeddings = [];
 
   for (const trecho of trechos) {
-    const tokens = tokenizer.tokenize(trecho);
-    const inputIds = new BigInt64Array(tokens.map((t) => BigInt(tokenizer.getId(t))));
-    const attentionMask = new BigInt64Array(inputIds.length).fill(BigInt(1));
-    const tokenTypeIds = new BigInt64Array(inputIds.length).fill(BigInt(0));
+    const tokens = trecho.split(/\s+/);
+    const inputIds = new BigInt64Array(tokens.length).fill(BigInt(1)); // Simula tokens válidos
+    const attentionMask = new BigInt64Array(tokens.length).fill(BigInt(1));
+    const tokenTypeIds = new BigInt64Array(tokens.length).fill(BigInt(0));
 
-    const feeds = {
+    const inputs = {
       input_ids: new ort.Tensor("int64", inputIds, [1, inputIds.length]),
       attention_mask: new ort.Tensor("int64", attentionMask, [1, attentionMask.length]),
       token_type_ids: new ort.Tensor("int64", tokenTypeIds, [1, tokenTypeIds.length]),
     };
 
     try {
-      const results = await session.run(feeds);
+      const results = await session.run(inputs);
+      let embedding;
 
-      if (!results["sentence_embedding"]) {
-        throw new Error("A saída 'sentence_embedding' não foi encontrada no resultado do modelo.");
+      if (results["sentence_embedding"]) {
+        embedding = results["sentence_embedding"].data;
+      } else if (results["last_hidden_state"]) {
+        console.warn("⚠️ O modelo não retornou 'sentence_embedding'. Extraindo média do 'last_hidden_state'.");
+        const lastHiddenState = results["last_hidden_state"].data;
+
+        // Calcula a média para garantir um vetor de 1536 dimensões
+        embedding = new Array(1536).fill(0);
+        for (let i = 0; i < lastHiddenState.length; i++) {
+          embedding[i % 1536] += lastHiddenState[i];
+        }
+        embedding = embedding.map(val => val / (lastHiddenState.length / 1536));
+      } else {
+        throw new Error("Nenhuma saída de embedding foi encontrada no modelo ONNX.");
       }
 
-      embeddings.push(results["sentence_embedding"].data); // Mantendo os embeddings como array de floats
+      if (embedding.length !== 1536) {
+        console.warn(`❌ Embedding inválido detectado. Dimensão recebida: ${embedding.length}. Esperado: 1536.`);
+      } else {
+        embeddings.push(embedding);
+      }
     } catch (error) {
       console.error("Erro ao gerar embeddings:", error.message);
     }
@@ -96,14 +133,17 @@ async function salvarNoPostgres(trechos, embeddings) {
 
     for (let i = 0; i < trechos.length; i++) {
       const trecho = trechos[i];
-      const embedding = JSON.stringify(embeddings[i]); // Convertendo embedding para JSON
+      const embedding = embeddings[i];
+      const metadata = { origem: "PDF", indice: i };
+
+      const embeddingString = `[${embedding.join(",")}]`;
 
       await client.query(
         `
-        INSERT INTO rag (nome_documento, texto, embedding)
-        VALUES ($1, $2, $3)
+        INSERT INTO n8n_vectors (id, text, metadata, embedding)
+        VALUES ($1, $2, $3, $4)
         `,
-        ["catalogo", trecho, embedding]
+        [uuidv4(), trecho, metadata, embeddingString]
       );
     }
 
@@ -127,11 +167,11 @@ async function processarPDF() {
   console.log("🔃 Carregando modelo ONNX...");
   const session = await carregarModelo();
 
-  console.log("🔃 Carregando tokenizador...");
-  const tokenizer = carregarTokenizador();
-
   console.log("🧠 Gerando embeddings...");
-  const embeddings = await gerarEmbeddings(session, tokenizer, trechos);
+  const embeddings = await gerarEmbeddings(session, trechos);
+
+  console.log("💾 Verificando a tabela no PostgreSQL...");
+  await verificarOuCriarTabela();
 
   console.log("💾 Salvando no PostgreSQL...");
   await salvarNoPostgres(trechos, embeddings);

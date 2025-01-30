@@ -20,6 +20,8 @@
     "onnxruntime-node": "^1.20.1",
     "pdf-parse": "^1.1.1",
     "pg": "^8.13.1",
-    "simple-tokenizer": "^1.0.2"
+    "simple-tokenizer": "^1.0.2",
+    "tokenizers": "^0.13.3",
+    "uuid": "^11.0.5"
   }
 }
